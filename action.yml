@@ -1,0 +1,181 @@
+name: 'codex installer'
+description: 'Install Codex in your CICD workflow'
+branding:
+  icon: 'box'
+  color: 'purple'
+
+inputs:
+  project-path: # path to folder
+    description: 'Project path to codex.json. Default to the root directory of the repository.'
+    default: '.'
+  enable-cache: # 'true' or 'false'
+    description: 'Caching the entire Nix store in github based on your codex.json'
+    default: 'false'
+  refresh-cli: # 'true' or 'false'
+    description: 'Specify whether the CLI should be redownloaded'
+    default: 'false'
+  codex-version: # version of the codex cli
+    description: 'Specify codex CLI version you want to pin to. Default to latest'
+    default: ''
+  sha256-checksum: # the expected SHA256 checksum of the codex binary.
+    description: 'Specify an explicit checksum for the codex binary. For extra security on top of the existing checks in the codex launch script'
+  disable-nix-access-token: # 'true' or 'false'
+    description: 'Disable configuration of nix access-tokens with the GitHub token used in the workflow'
+    default: 'false'
+  skip-nix-installation: # 'true' or 'false'
+    description: 'Skip the installation of nix'
+    default: 'false'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Get codex version
+      shell: bash
+      env:
+        CODEX_USE_VERSION: ${{ inputs.codex-version }}
+      run: |
+        if [[ -n $CODEX_USE_VERSION ]]; then
+          echo "latest_version=$CODEX_USE_VERSION" >> $GITHUB_ENV
+        else
+          tmp_file=$(mktemp)
+          latest_url="https://releases.jetify.com/codex/stable/version"
+          curl --fail --silent --location --output "${tmp_file}" "${latest_url}"
+          latest_version=$(cat "${tmp_file}")
+          if [[ -n ${latest_version} ]]; then
+            echo "Found codex latest version ${latest_version}."
+            echo "latest_version=$latest_version" >> $GITHUB_ENV
+          else
+            echo "ERROR: unable to find the latest codex version."
+            exit 1
+          fi
+        fi
+
+    - name: Mount codex cli cache
+      if: inputs.refresh-cli == 'false'
+      id: cache-codex-cli
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.local/bin/codex
+        key: ${{ runner.os }}-${{ runner.arch }}-codex-cli-${{ env.latest_version }}
+
+    - name: Install codex cli
+      if: steps.cache-codex-cli.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CODEX_SHA256: ${{ inputs.sha256-checksum }}
+      run: |
+        export CODEX_USE_VERSION="${{ env.latest_version }}"
+        curl -fsSL https://raw.githubusercontent.com/khulnasoft/CodeX/master/codex | FORCE=1 bash
+
+        version=$(codex version)
+        if [[ ! "$version" = "$CODEX_USE_VERSION" ]]; then
+          echo "ERROR: mismatch codex version downloaded. Expected $CODEX_USE_VERSION, got $version."
+          exit 1
+        fi
+        CODEX_BINARY="$(find "${HOME}/.cache/codex/bin" -name codex)"
+        if [ -n "$CODEX_SHA256" ]; then
+          if command -v "sha256sum" 1>/dev/null 2>&1; then
+            # Linux distributions will likely have this.
+            CODEX_CHECKSUM="$(sha256sum "$CODEX_BINARY" | cut -f1 -d' ')"
+          elif command -v "shasum" 1>/dev/null 2>&1; then
+            # MacOS comes with this.
+            CODEX_CHECKSUM="$(shasum -a 256 "$CODEX_BINARY" | cut -f1 -d' ')"
+          fi
+
+          if [ -z "$CODEX_CHECKSUM" ]; then
+            echo "ERROR: unable to get codex checksum. Please ensure sha256sum or shasum is installed."
+            exit 2
+          fi
+
+          if [[ ! "$CODEX_CHECKSUM" = "$CODEX_SHA256" ]]; then
+            echo "ERROR: checksums do not match. Expected $CODEX_SHA256, got $CODEX_CHECKSUM."
+            exit 3
+          fi
+        fi
+        mkdir -p ~/.local/bin
+        mv "$CODEX_BINARY" ~/.local/bin/codex
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: Save codex cli cache
+      if: inputs.refresh-cli == 'false' && steps.cache-codex-cli.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.local/bin/codex
+        key: ${{ runner.os }}-${{ runner.arch }}-codex-cli-${{ env.latest_version }}
+
+    - name: Workaround nix store cache permission issue
+      if: inputs.enable-cache == 'true'
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" == "macOS" ]; then
+          gtar_path=$(which gtar)
+          sudo mv $gtar_path $gtar_path.orig
+          echo "#!/bin/sh" >> $gtar_path
+          echo "exec sudo $gtar_path.orig \"\$@\"" >> $gtar_path
+          sudo chmod +x $gtar_path
+        elif [ "$RUNNER_OS" == "Linux" ]; then
+          mkdir -p ~/.cache
+          mkdir -p ~/.local/bin
+          echo "#!/bin/sh" >> ~/.local/bin/tar
+          echo 'exec sudo /usr/bin/tar "$@"' >> ~/.local/bin/tar
+          sudo chmod +x ~/.local/bin/tar
+        fi
+
+    - name: Configure nix access-tokens
+      if: inputs.disable-nix-access-token == 'false'
+      shell: bash
+      run: |
+        mkdir -p ~/.config/nix
+        echo "access-tokens = github.com=${{ github.token }}" >> ~/.config/nix/nix.conf
+
+    - name: Install nix
+      if: inputs.skip-nix-installation == 'false'
+      uses: DeterminateSystems/nix-installer-action@7993355175c2765e5733dae74f3e0786fe0e5c4f  # v12
+      with:
+        logger: pretty
+        extra-conf: experimental-features = ca-derivations fetch-closure
+
+    - name: Mount nix store cache
+      id: cache-codex-nix-store
+      if: inputs.enable-cache == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/codex
+          ~/.cache/nix
+          ~/.local/state/nix
+          ~/.nix-defexpr
+          ~/.nix-profile
+          /nix/store
+          /nix/var/nix
+        key: ${{ runner.os }}-${{ runner.arch }}-codex-nix-store-${{ hashFiles(format('{0}/codex.lock', inputs.project-path)) }}
+
+    - name: Install codex packages
+      shell: bash
+      run: |
+        codex run --config=${{ inputs.project-path }} -- echo "Packages installed!"
+
+    - name: Save nix store cache
+      if: inputs.enable-cache == 'true' && steps.cache-codex-nix-store.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cache/codex
+          ~/.cache/nix
+          ~/.local/state/nix
+          ~/.nix-defexpr
+          ~/.nix-profile
+          /nix/store
+          /nix/var/nix
+        key: ${{ runner.os }}-${{ runner.arch }}-codex-nix-store-${{ hashFiles(format('{0}/codex.lock', inputs.project-path)) }}
+
+    - name: Restore tar command
+      if: inputs.enable-cache == 'true'
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" == "macOS" ]; then
+          gtar_path=$(which gtar)
+          sudo mv $gtar_path.orig $gtar_path
+        elif [ "$RUNNER_OS" == "Linux" ]; then
+          rm ~/.local/bin/tar
+        fi
